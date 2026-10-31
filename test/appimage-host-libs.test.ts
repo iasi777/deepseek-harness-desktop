@@ -72,6 +72,22 @@ const HOST_INTERFACE_LIBS = [
  */
 const RENDER_STACK_LIBS = ['libEGL.so.1', 'libGL.so.1', 'libgbm.so.1', 'libdrm.so.2']
 
+/**
+ * 脚本追加到 GTK 钩子尾部的宿主 immodules.cache 查找段，逐字照抄脚本原文：
+ * 断言用同一份文本，避免测试里再抄一遍 shell 代码而与脚本漂移。
+ */
+const HOST_IM_CACHE_SNIPPET = [
+  // eslint-disable-next-line no-template-curly-in-string -- 断言对象是 shell 原文，`${...}` 必须逐字保留
+  'if [ -z "${GTK_IM_MODULE_FILE:-}" ]; then',
+  '  for dsh_im_cache in /usr/lib/*/gtk-3.0/3.0.0/immodules.cache /usr/lib64/gtk-3.0/3.0.0/immodules.cache; do',
+  `    if [ -f "$dsh_im_cache" ] && grep -Eq '"ibus"|"fcitx"' "$dsh_im_cache"; then`,
+  '      export GTK_IM_MODULE_FILE="$dsh_im_cache"',
+  '      break',
+  '    fi',
+  '  done',
+  'fi',
+]
+
 function excludedLibsArray(): string {
   const match = /^readonly EXCLUDED_LIBS=\(\n([\s\S]*?)^\)/m.exec(fixScript)
   if (!match)
@@ -113,6 +129,19 @@ describe('appimage host-interface library exclusion (#620)', () => {
       expect(fixScript, `自检必须保留 ${required}`).toContain(required)
     // 交付前在独立目录复核剔除结果，避免只看已被剪过的同一棵树。
     expect(fixScript).toContain('verify="$work/verify"')
+  })
+
+  it('repoints GTK_IM_MODULE_FILE at the host immodules.cache', () => {
+    // 镜像自带的 immodules.cache 只登记镜像内的模块，宿主 GTK 的 im-ibus.so / im-fcitx5.so 不在其中，
+    // 钩子把 GTK_IM_MODULE_FILE 钉死在这份缓存上会让 ibus/fcitx 输入法整体失效。
+    expect(fixScript).toContain('GTK_IM_CACHE_PATTERN')
+    expect(fixScript).toMatch(/immodules\.cache/)
+    expect(fixScript).toContain('dsh_im_cache')
+    expect(fixScript).toContain('"ibus"|"fcitx"')
+    // 用户自己指定过 GTK_IM_MODULE_FILE 时必须让位。
+    expect(fixScript).toContain(HOST_IM_CACHE_SNIPPET[0])
+    // 自检要拦住「钩子仍钉着 AppDir 缓存」的回归。
+    expect(fixScript).toContain('GTK_IM_CACHE_APPDIR_PATTERN')
   })
 
   it('supports --require-removal so a silent bundler change fails the build', () => {
@@ -209,7 +238,11 @@ describe('appimage host stack selection (#789, #1209)', () => {
       }
       if (bundledHostLibrary)
         writeFileSync(join(tree, 'usr/lib/libwayland-client.so.0'), 'drop host library')
-      writeFileSync(join(tree, 'apprun-hooks/linuxdeploy-plugin-gtk.sh'), 'export GTK_THEME=Adwaita\nexport GDK_BACKEND=x11 # upstream override\nexport GTK_DATA_PREFIX="$APPDIR"\n')
+      writeFileSync(join(tree, 'apprun-hooks/linuxdeploy-plugin-gtk.sh'), `export GTK_THEME=Adwaita
+export GDK_BACKEND=x11 # upstream override
+export GTK_DATA_PREFIX="$APPDIR"
+export GTK_IM_MODULE_FILE="$APPDIR/usr/lib/gtk-3.0/3.0.0/immodules.cache"
+`)
       const image = join(work, 'test.AppImage')
       execFileSync('mksquashfs', [tree, image, '-noappend', '-quiet', '-no-progress'], { stdio: 'inherit' })
       execFileSync('bash', [fixScriptPath, ...(bundledHostLibrary || bundledMedia ? ['--require-removal'] : []), image], { stdio: 'inherit' })
@@ -225,7 +258,24 @@ describe('appimage host stack selection (#789, #1209)', () => {
         const env = { ...process.env, QT_PLUGIN_PATH: '/custom/qt', GST_PLUGIN_SYSTEM_PATH_1_0: mediaPath }
         execFileSync('bash', [join(output, 'AppRun'), mediaPath === undefined ? '' : 'x', mediaPath ?? ''], { env, stdio: 'inherit' })
       }
-      expect(readFileSync(hook, 'utf8')).toBe('export GTK_THEME=Adwaita\nexport GTK_DATA_PREFIX="$APPDIR"\n')
+      const hookSource = readFileSync(hook, 'utf8')
+      // 上游钩子里的 GDK_BACKEND 与 GTK_IM_MODULE_FILE 两行必须消失，尾部换成查宿主缓存的循环。
+      expect(hookSource).toBe([
+        'export GTK_THEME=Adwaita',
+        'export GTK_DATA_PREFIX="$APPDIR"',
+        ...HOST_IM_CACHE_SNIPPET,
+        '',
+      ].join('\n'))
+      expect(hookSource).not.toContain('$APPDIR/usr/lib/gtk-3.0/3.0.0/immodules.cache')
+      // 用户自己设过 GTK_IM_MODULE_FILE 时，钩子必须让位，不能覆盖成宿主缓存。
+      const hostCache = join(work, 'host-immodules.cache')
+      writeFileSync(hostCache, '# host cache\n"/usr/lib/x86_64-linux-gnu/gtk-3.0/3.0.0/immodules/im-ibus.so"\n"ibus" "IBus" "gtk30" "/usr/share/locale" "ja:ko:zh:*"\n')
+      expect(
+        execFileSync('bash', ['-c', 'source "$1"; printf %s "$GTK_IM_MODULE_FILE"', '_', hook], {
+          env: { ...process.env, GTK_IM_MODULE_FILE: hostCache },
+          encoding: 'utf8',
+        }),
+      ).toBe(hostCache)
       for (const backend of ['', 'wayland', 'x11', 'x11,wayland']) {
         execFileSync('bash', ['-c', 'source "$1"; test "$GDK_BACKEND" = "$2" && test "$GTK_THEME" = Adwaita', '_', hook, backend], {
           env: { ...process.env, GDK_BACKEND: backend },

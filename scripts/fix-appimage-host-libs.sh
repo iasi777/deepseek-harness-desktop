@@ -36,6 +36,9 @@ readonly SQUASHFS_COMPRESSION=zstd
 readonly SQUASHFS_BLOCK_SIZE=131072
 readonly GTK_HOOK=apprun-hooks/linuxdeploy-plugin-gtk.sh
 readonly GDK_OVERRIDE_PATTERN='^[[:space:]]*export[[:space:]]+GDK_BACKEND=x11([[:space:]]+#.*)?[[:space:]]*$'
+readonly GTK_IM_CACHE_PATTERN='^export[[:space:]]+GTK_IM_MODULE_FILE='
+readonly GTK_IM_CACHE_APPDIR_PATTERN='GTK_IM_MODULE_FILE=["]?[$]APPDIR'
+
 readonly GSTREAMER_SOURCE_PATTERN='^[[:space:]]*source[[:space:]].*apprun-hooks/linuxdeploy-plugin-gstreamer[.]sh[[:space:]]*$'
 readonly GSTREAMER_NATIVE_PATTERN='GST_PLUGIN_SYSTEM_PATH(_1_0)?='
 # #1269：宿主 GStreamer(>=1.24) 链接新版 GLib，镜像里 22.04 的 GLib 2.72 被 LD_LIBRARY_PATH 置顶后缺 g_once_init_leave_pointer，加载器在 main() 前中止。
@@ -200,6 +203,26 @@ if [ -f "$tree/$GTK_HOOK" ] && grep -Eq "$GDK_OVERRIDE_PATTERN" "$tree/$GTK_HOOK
   hook_changed=1
 fi
 
+ime_changed=0
+# Why：镜像自带的 immodules.cache 只登记镜像内的输入法模块（相对路径），而 im-ibus.so / im-fcitx5.so
+# 属于宿主 GTK，镜像里根本没有；钩子却把 GTK_IM_MODULE_FILE 钉在这份缓存上，于是宿主按 GTK_IM_MODULE=ibus
+# 选输入法时找不到模块，输入法整体失效（中文打不出来）。改指宿主缓存即可命中宿主的输入法模块；
+# 用户自己设过 GTK_IM_MODULE_FILE 时保持不动。
+if [ -f "$tree/$GTK_HOOK" ] && grep -Eq "$GTK_IM_CACHE_PATTERN" "$tree/$GTK_HOOK"; then
+  sed -Ei "/$GTK_IM_CACHE_PATTERN/d" "$tree/$GTK_HOOK"
+  cat >> "$tree/$GTK_HOOK" <<'DSH_IM_CACHE'
+if [ -z "${GTK_IM_MODULE_FILE:-}" ]; then
+  for dsh_im_cache in /usr/lib/*/gtk-3.0/3.0.0/immodules.cache /usr/lib64/gtk-3.0/3.0.0/immodules.cache; do
+    if [ -f "$dsh_im_cache" ] && grep -Eq '"ibus"|"fcitx"' "$dsh_im_cache"; then
+      export GTK_IM_MODULE_FILE="$dsh_im_cache"
+      break
+    fi
+  done
+fi
+DSH_IM_CACHE
+  ime_changed=1
+fi
+
 if [ "${#removed[@]}" -eq 0 ]; then
   if [ "$require_removal" -eq 1 ]; then
     echo "fix-appimage-host-libs: none of the host-interface libraries or media stack were bundled, but" >&2
@@ -207,8 +230,8 @@ if [ "${#removed[@]}" -eq 0 ]; then
     echo "  is no longer happening, or the bundler changed. Re-verify before dropping the fix." >&2
     exit 1
   fi
-  if [ "$hook_changed" -eq 0 ] && [ "$launcher_changed" -eq 0 ] && [ "$native_changed" -eq 0 ]; then
-    echo "fix-appimage-host-libs: no bundled host/media stack or forced GTK backend, nothing to do"
+  if [ "$hook_changed" -eq 0 ] && [ "$launcher_changed" -eq 0 ] && [ "$native_changed" -eq 0 ] && [ "$ime_changed" -eq 0 ]; then
+    echo "fix-appimage-host-libs: no bundled host/media stack, forced GTK backend or AppDir IM cache, nothing to do"
     exit 0
   fi
 fi
@@ -219,6 +242,9 @@ if [ "${#removed[@]}" -gt 0 ]; then
 fi
 if [ "$hook_changed" -eq 1 ]; then
   echo "fix-appimage-host-libs: removed GTK hook's forced GDK_BACKEND=x11"
+fi
+if [ "$ime_changed" -eq 1 ]; then
+  echo "fix-appimage-host-libs: pointed GTK_IM_MODULE_FILE at the host immodules.cache"
 fi
 
 head -c "$offset" "$work/in.AppImage" > "$work/out.AppImage"
@@ -277,6 +303,14 @@ if grep -Eq "$GSTREAMER_SOURCE_PATTERN" "$verified/AppRun"; then
 fi
 if [ -f "$verified/$GTK_HOOK" ] && grep -Eq "$GDK_OVERRIDE_PATTERN" "$verified/$GTK_HOOK"; then
   echo "fix-appimage-host-libs: verification failed, GTK hook still forces GDK_BACKEND=x11" >&2
+  verdict=1
+fi
+if [ -f "$verified/$GTK_HOOK" ] && grep -Eq "$GTK_IM_CACHE_APPDIR_PATTERN" "$verified/$GTK_HOOK"; then
+  echo "fix-appimage-host-libs: verification failed, GTK hook still pins GTK_IM_MODULE_FILE to the AppDir cache" >&2
+  verdict=1
+fi
+if [ "$ime_changed" -eq 1 ] && ! grep -q 'dsh_im_cache' "$verified/$GTK_HOOK"; then
+  echo "fix-appimage-host-libs: verification failed, GTK hook lost the host immodules.cache lookup" >&2
   verdict=1
 fi
 if [ "$hook_changed" -eq 1 ] && [ ! -f "$verified/$GTK_HOOK" ]; then
